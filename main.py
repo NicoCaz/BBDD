@@ -29,7 +29,6 @@ class AsignacionGuardia(BaseModel):
     id_guardia: int
     nro_matricula_medico: str
     id_administrador: int
-    tipo_operacion: str
     descripcion: Optional[str] = None
 
 class Medico(BaseModel):
@@ -351,7 +350,7 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
         cursor.execute("""
             SELECT COUNT(*)
             FROM HOSPITAL.Vacacion v
-            WHERE v.nro_matricula_medico = :1
+            WHERE v.nro_matricula = :1
             AND :2 BETWEEN v.fecha_inicio AND v.fecha_fin
         """, [asignacion.nro_matricula_medico, fecha_guardia])
 
@@ -436,16 +435,15 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
                 VALUES (:1, :2)
             """, [asignacion.id_guardia, asignacion.nro_matricula_medico])
 
-            # Registrar en la tabla Administra
+            # Registrar en la tabla Administra con tipo de operación 'CREACION'
             cursor.execute("""
                 INSERT INTO HOSPITAL.Administra 
                 (id_administrador, id_guardia, fecha, descripcion, tipo_operacion)
-                VALUES (:1, :2, SYSTIMESTAMP, :3, :4)
+                VALUES (:1, :2, SYSTIMESTAMP, :3, 'CREACION')
             """, [
                 asignacion.id_administrador,
                 asignacion.id_guardia,
                 asignacion.descripcion,
-                'CREACION'
             ])
 
             # Commit de la transacción
@@ -461,3 +459,56 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/guardias/desasignar/")
+async def desasignar_medico(asignacion: AsignacionGuardia, db: oracledb.Connection = Depends(get_db)):
+    try:
+        cursor = db.cursor()
+
+        # Verificar si la guardia existe
+        cursor.execute(
+            "SELECT COUNT(*) FROM HOSPITAL.Guardia WHERE id_guardia = :1",
+            [asignacion.id_guardia]
+        )
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail="Guardia no encontrada")
+
+        # Verificar si el médico está asignado a la guardia
+        cursor.execute("""
+            SELECT COUNT(*) 
+            FROM HOSPITAL.Tiene_Asignada 
+            WHERE id_guardia = :1 AND nro_matricula_medico = :2
+        """, [asignacion.id_guardia, asignacion.nro_matricula_medico])
+
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail="El médico no está asignado a esta guardia")
+
+        # Eliminar la asignación del médico de la guardia
+        cursor.execute("""
+            DELETE FROM HOSPITAL.Tiene_Asignada 
+            WHERE id_guardia = :1 AND nro_matricula_medico = :2
+        """, [asignacion.id_guardia, asignacion.nro_matricula_medico])
+
+        # Registrar la acción del administrador con tipo de operación 'ELIMINACION'
+        cursor.execute("""
+            INSERT INTO HOSPITAL.Administra 
+            (id_administrador, id_guardia, fecha, descripcion, tipo_operacion)
+            VALUES (:1, :2, SYSTIMESTAMP, :3, 'ELIMINACION')
+        """, [
+            asignacion.id_administrador,
+            asignacion.id_guardia,
+            f"Eliminación de médico {asignacion.nro_matricula_medico} de la guardia"
+        ])
+
+        # Commit de la transacción
+        db.commit()
+
+        return {
+            "message": f"Médico {asignacion.nro_matricula_medico} eliminado de la guardia {asignacion.id_guardia} con éxito"
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error en la transacción: {str(e)}")
