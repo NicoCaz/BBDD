@@ -47,6 +47,13 @@ class MedicoSimple(BaseModel):
     nombre_completo: str
     especialidades: List[str] = []
 
+    
+class Guardia(BaseModel):
+    id_guardia: int
+    dia: datetime
+    turno: str
+    nro_matricula_medico: Optional[str] = None  # Médico asignado
+    especialidad: Optional[str] = None          # Especialidad requerida
 
 # Función para conectar a la base de datos
 async def get_db():
@@ -55,6 +62,58 @@ async def get_db():
         yield conn
     finally:
         conn.close()
+
+@app.get("/guardias/", response_model=List[Guardia])
+async def get_guardias(
+    fecha_inicio: Optional[str] = None,  # Fecha de inicio en formato YYYY-MM-DD
+    fecha_fin: Optional[str] = None,    # Fecha de fin en formato YYYY-MM-DD
+    db: oracledb.Connection = Depends(get_db)
+):
+    try:
+        cursor = db.cursor()
+        params = []
+        query = """
+        SELECT 
+            g.id_guardia, 
+            g.dia, 
+            g.turno, 
+            ta.nro_matricula_medico,
+            e.nombre AS especialidad
+        FROM HOSPITAL.Guardia g
+        LEFT JOIN HOSPITAL.Tiene_Asignada ta ON g.id_guardia = ta.id_guardia
+        LEFT JOIN HOSPITAL.Esta_asociada ea ON ta.nro_matricula_medico = ea.nro_matricula_medico
+        LEFT JOIN HOSPITAL.Especialidad e ON ea.id_especialidad = e.id_especialidad
+        WHERE 1=1
+        """
+
+        # Filtro por rango de fechas, solo si se pasan los parámetros
+        if fecha_inicio:
+            query += " AND TRUNC(g.dia) >= TO_DATE(:1, 'YYYY-MM-DD')"
+            params.append(fecha_inicio)
+        if fecha_fin:
+            query += " AND TRUNC(g.dia) <= TO_DATE(:2, 'YYYY-MM-DD')"
+            params.append(fecha_fin)
+
+        query += " ORDER BY g.dia, g.turno"
+        
+        # Ejecutar consulta
+        cursor.execute(query, params)
+        guardias = [
+            Guardia(
+                id_guardia=row[0],
+                dia=row[1],
+                turno=row[2],
+                nro_matricula_medico=row[3],
+                especialidad=row[4]
+            )
+            for row in cursor
+        ]
+        
+        return guardias
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Endpoints para Administradores
 @app.get("/administradores/", response_model=List[Administrador])
@@ -262,12 +321,11 @@ async def get_medicos_disponibles(
 
 
 
-# Endpoint para asignar/modificar guardia
 @app.post("/guardias/asignar/")
 async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection = Depends(get_db)):
     try:
         cursor = db.cursor()
-        
+
         # Verificar si la guardia existe
         cursor.execute(
             "SELECT COUNT(*) FROM HOSPITAL.Guardia WHERE id_guardia = :1",
@@ -275,6 +333,30 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
         )
         if cursor.fetchone()[0] == 0:
             raise HTTPException(status_code=404, detail="Guardia no encontrada")
+
+        # Obtener la fecha de la guardia
+        cursor.execute("""
+            SELECT g.dia
+            FROM HOSPITAL.Guardia g
+            WHERE g.id_guardia = :1
+        """, [asignacion.id_guardia])
+        result = cursor.fetchone()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Fecha de la guardia no encontrada")
+
+        fecha_guardia = result[0]
+
+        # Verificar si el médico está de vacaciones en la fecha de la guardia
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM HOSPITAL.Vacacion v
+            WHERE v.nro_matricula = :1
+            AND :2 BETWEEN v.fecha_inicio AND v.fecha_fin
+        """, [asignacion.nro_matricula_medico, fecha_guardia])
+
+        if cursor.fetchone()[0] > 0:
+            raise HTTPException(status_code=400, detail="El médico está de vacaciones en la fecha de la guardia")
 
         # Verificar si el médico existe
         cursor.execute(
@@ -284,13 +366,65 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
         if cursor.fetchone()[0] == 0:
             raise HTTPException(status_code=404, detail="Médico no encontrado")
 
+        # Obtener el mes y el año de la guardia a asignar
+        cursor.execute("""
+            SELECT EXTRACT(MONTH FROM g.dia), EXTRACT(YEAR FROM g.dia), g.id_especialidad
+            FROM HOSPITAL.Guardia g
+            WHERE g.id_guardia = :1
+        """, [asignacion.id_guardia])
+
+        result = cursor.fetchone()
+        if not result:
+            raise HTTPException(status_code=404, detail="Guardia no encontrada en la base de datos")
+        
+        mes_guardia, anio_guardia, id_especialidad_guardia = result
+
+        # Verificar si el médico tiene la especialidad de la guardia
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM HOSPITAL.Esta_asociada ea
+            WHERE ea.nro_matricula_medico = :1
+            AND ea.id_especialidad = :2
+        """, [asignacion.nro_matricula_medico, id_especialidad_guardia])
+
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=400, detail="El médico no tiene la especialidad requerida para esta guardia")
+
+        # Obtener la cantidad de guardias que ya tiene asignadas el médico en el mismo mes y año
+        cursor.execute("""
+            SELECT COUNT(*) 
+            FROM HOSPITAL.Tiene_Asignada ta
+            JOIN HOSPITAL.Guardia g ON ta.id_guardia = g.id_guardia
+            WHERE ta.nro_matricula_medico = :1
+            AND EXTRACT(MONTH FROM g.dia) = :2
+            AND EXTRACT(YEAR FROM g.dia) = :3
+        """, [asignacion.nro_matricula_medico, mes_guardia, anio_guardia])
+
+        cantidad_guardias = cursor.fetchone()[0]
+
+        # Obtener el límite de guardias por mes para el médico
+        cursor.execute("""
+            SELECT CANTIDADGUARDIASMES 
+            FROM HOSPITAL.Medico
+            WHERE nro_matricula = :1
+        """, [asignacion.nro_matricula_medico])
+
+        cantidad_guardias_mes = cursor.fetchone()[0]
+
+        # Validar que el médico no exceda el límite de guardias en ese mes
+        if cantidad_guardias >= cantidad_guardias_mes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El médico ya tiene asignadas {cantidad_guardias} guardias en el mes {mes_guardia}/{anio_guardia}, superando el límite de {cantidad_guardias_mes}."
+            )
+
         # Verificar si ya existe una asignación
         cursor.execute("""
             SELECT COUNT(*) 
             FROM HOSPITAL.Tiene_Asignada 
             WHERE id_guardia = :1
         """, [asignacion.id_guardia])
-        
+
         asignacion_existe = cursor.fetchone()[0] > 0
         
         # Iniciar transacción
@@ -338,50 +472,4 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Validaciones adicionales
-@app.get("/guardias/validar-asignacion/{id_guardia}/{nro_matricula}/")
-async def validar_asignacion_guardia(
-    id_guardia: int,
-    nro_matricula: str,
-    db: oracledb.Connection = Depends(get_db)
-):
-    try:
-        cursor = db.cursor()
-        
-        # 1. Verificar si el médico está de vacaciones en la fecha de la guardia
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM HOSPITAL.Guardia g
-            JOIN HOSPITAL.Vacacion v ON g.dia BETWEEN v.fecha_inicio AND v.fecha_fin
-            WHERE g.id_guardia = :1 AND v.nro_matricula = :2
-        """, [id_guardia, nro_matricula])
-        
-        if cursor.fetchone()[0] > 0:
-            return {"valid": False, "reason": "El médico está de vacaciones en la fecha de la guardia"}
 
-        # 2. Verificar cantidad de guardias del mes
-        cursor.execute("""
-            SELECT 
-                m.cantidadGuardiasMes,
-                COUNT(ta.id_guardia) as guardias_asignadas
-            FROM HOSPITAL.Medico m
-            LEFT JOIN HOSPITAL.Tiene_Asignada ta ON m.nro_matricula = ta.nro_matricula_medico
-            LEFT JOIN HOSPITAL.Guardia g ON ta.id_guardia = g.id_guardia
-                AND EXTRACT(MONTH FROM g.dia) = EXTRACT(MONTH FROM (
-                    SELECT dia FROM HOSPITAL.Guardia WHERE id_guardia = :1
-                ))
-                AND EXTRACT(YEAR FROM g.dia) = EXTRACT(YEAR FROM (
-                    SELECT dia FROM HOSPITAL.Guardia WHERE id_guardia = :1
-                ))
-            WHERE m.nro_matricula = :2
-            GROUP BY m.cantidadGuardiasMes
-        """, [id_guardia, nro_matricula])
-        
-        row = cursor.fetchone()
-        if row and row[1] >= row[0]:
-            return {"valid": False, "reason": "El médico ya alcanzó su máximo de guardias mensuales"}
-
-        return {"valid": True}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
