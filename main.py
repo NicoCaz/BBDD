@@ -351,7 +351,7 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
         cursor.execute("""
             SELECT COUNT(*)
             FROM HOSPITAL.Vacacion v
-            WHERE v.nro_matricula = :1
+            WHERE v.nro_matricula_medico = :1
             AND :2 BETWEEN v.fecha_inicio AND v.fecha_fin
         """, [asignacion.nro_matricula_medico, fecha_guardia])
 
@@ -418,30 +418,23 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
                 detail=f"El médico ya tiene asignadas {cantidad_guardias} guardias en el mes {mes_guardia}/{anio_guardia}, superando el límite de {cantidad_guardias_mes}."
             )
 
-        # Verificar si ya existe una asignación
+        # Verificar si el médico ya está asignado a la guardia
         cursor.execute("""
-            SELECT COUNT(*) 
-            FROM HOSPITAL.Tiene_Asignada 
-            WHERE id_guardia = :1
-        """, [asignacion.id_guardia])
+            SELECT COUNT(*)
+            FROM HOSPITAL.Tiene_Asignada ta
+            WHERE ta.id_guardia = :1 AND ta.nro_matricula_medico = :2
+        """, [asignacion.id_guardia, asignacion.nro_matricula_medico])
 
-        asignacion_existe = cursor.fetchone()[0] > 0
-        
+        if cursor.fetchone()[0] > 0:
+            raise HTTPException(status_code=400, detail="El médico ya está asignado a esta guardia")
+
         # Iniciar transacción
         try:
-            if not asignacion_existe:
-                # Crear nueva asignación
-                cursor.execute("""
-                    INSERT INTO HOSPITAL.Tiene_Asignada (id_guardia, nro_matricula_medico)
-                    VALUES (:1, :2)
-                """, [asignacion.id_guardia, asignacion.nro_matricula_medico])
-            else:
-                # Actualizar asignación existente
-                cursor.execute("""
-                    UPDATE HOSPITAL.Tiene_Asignada 
-                    SET nro_matricula_medico = :1
-                    WHERE id_guardia = :2
-                """, [asignacion.nro_matricula_medico, asignacion.id_guardia])
+            # Crear nueva asignación en la tabla Tiene_Asignada (sin hacer UPDATE)
+            cursor.execute("""
+                INSERT INTO HOSPITAL.Tiene_Asignada (id_guardia, nro_matricula_medico)
+                VALUES (:1, :2)
+            """, [asignacion.id_guardia, asignacion.nro_matricula_medico])
 
             # Registrar en la tabla Administra
             cursor.execute("""
@@ -452,16 +445,13 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
                 asignacion.id_administrador,
                 asignacion.id_guardia,
                 asignacion.descripcion,
-                'CREACION' if not asignacion_existe else 'MODIFICACION'
+                'CREACION'
             ])
 
             # Commit de la transacción
             db.commit()
 
-            return {
-                "message": "Asignación de guardia exitosa",
-                "tipo_operacion": 'CREACION' if not asignacion_existe else 'MODIFICACION'
-            }
+            return {"message": "Asignación de guardia exitosa", "tipo_operacion": 'CREACION'}
 
         except Exception as e:
             db.rollback()
@@ -471,5 +461,3 @@ async def asignar_guardia(asignacion: AsignacionGuardia, db: oracledb.Connection
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
